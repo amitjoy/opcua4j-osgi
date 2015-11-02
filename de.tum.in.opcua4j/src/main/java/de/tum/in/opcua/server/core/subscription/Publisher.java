@@ -1,0 +1,191 @@
+package de.tum.in.opcua.server.core.subscription;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+
+import org.apache.log4j.Logger;
+import org.opcfoundation.ua.builtintypes.DataValue;
+import org.opcfoundation.ua.builtintypes.DateTime;
+import org.opcfoundation.ua.builtintypes.ExtensionObject;
+import org.opcfoundation.ua.builtintypes.StatusCode;
+import org.opcfoundation.ua.builtintypes.UnsignedInteger;
+import org.opcfoundation.ua.builtintypes.Variant;
+import org.opcfoundation.ua.core.DataChangeNotification;
+import org.opcfoundation.ua.core.MonitoredItemNotification;
+import org.opcfoundation.ua.core.NotificationMessage;
+import org.opcfoundation.ua.core.PublishRequest;
+import org.opcfoundation.ua.core.PublishResponse;
+import org.opcfoundation.ua.core.SubscriptionAcknowledgement;
+import org.opcfoundation.ua.encoding.EncodingException;
+import org.opcfoundation.ua.transport.EndpointServiceRequest;
+
+import de.tum.in.opcua.server.handler.ServiceHandlerBase;
+
+public class Publisher {
+
+	private final Subscription subscription;
+	private final PublishReqCollection publishRequests;
+
+	private final ScheduledExecutorService scheduledThreadPool = Executors
+			.newScheduledThreadPool(1);
+	private ScheduledFuture<?> schedule;
+	private int sequenceNumber = 0;
+
+	/**
+	 * @param subscription
+	 */
+	public Publisher(Subscription subscription,
+			PublishReqCollection publishRequests) {
+		this.subscription = subscription;
+		this.publishRequests = publishRequests;
+
+		configure();
+	}
+
+	/**
+	 * configures timeouts, queuesizes, ... based on the Subscription. If values
+	 * of the Subscription change, this method has to be called to adapt
+	 * publishinginterval and so on to the new values.
+	 */
+	public void configure() {
+		if (subscription.isPublishingEnabled()) {
+			stopPublishing();
+			startPublishing();
+		} else {
+			stopPublishing();
+		}
+	}
+
+	private void startPublishing() {
+		schedule = scheduledThreadPool.scheduleWithFixedDelay(
+				new PublishTask(), 0,
+				(long) subscription.getPublishingInterval(),
+				TimeUnit.MILLISECONDS);
+	}
+
+	public void stopPublishing() {
+		if (schedule != null && !schedule.isCancelled()) {
+			schedule.cancel(false);
+		}
+	}
+
+	class PublishTask implements Runnable {
+
+		private final Logger LOG = Logger.getLogger(PublishTask.class);
+
+		@Override
+		public void run() {
+			try {
+				LOG.info("preparing notification for subscription "
+						+ subscription.getId());
+
+				EndpointServiceRequest<PublishRequest, PublishResponse> serviceReq;
+				try {
+					serviceReq = publishRequests.take(subscription
+							.getSessionId());
+					if (serviceReq == null) {
+						// TODO what to do here? we cannot send a message
+						// because there is no publish request we can use
+						return;
+					}
+					LOG.info("got publishing request");
+				} catch (final InterruptedException e) {
+					LOG.error(e.getMessage(), e);
+					// TODO what to do here? we cannot send a message because
+					// there is no publish request we can use
+					return;
+				}
+
+				final PublishRequest req = serviceReq.getRequest();
+				final PublishResponse resp = new PublishResponse();
+
+				/*
+				 * clear resources for acknowledged notifications from the last
+				 * publish response and create results StausCodes
+				 */
+				final SubscriptionAcknowledgement[] acks = req
+						.getSubscriptionAcknowledgements();
+				StatusCode[] results = null;
+				if (acks != null) {
+					results = new StatusCode[acks.length];
+					int i = 0;
+					for (final SubscriptionAcknowledgement ack : acks) {
+						// TODO clear acknowledged Notification
+
+						results[i++] = StatusCode.GOOD;
+					}
+				}
+
+				resp.setResults(results);
+
+				/*
+				 * create new Notifications message for this publishing-cycle
+				 */
+				resp.setSubscriptionId(new UnsignedInteger(subscription.getId()));
+				resp.setMoreNotifications(false);
+				final NotificationMessage notificatioMsg = new NotificationMessage();
+				notificatioMsg.setPublishTime(new DateTime());
+				notificatioMsg.setSequenceNumber(new UnsignedInteger(
+						sequenceNumber));
+
+				// TODO build notification message
+				final ExtensionObject[] dataArray = new ExtensionObject[1];
+				final DataChangeNotification dataChangeNotification = new DataChangeNotification();
+
+				try {
+					final List<MonitoredItemNotification> itemNotifications = new ArrayList<MonitoredItemNotification>();
+
+					/*
+					 * we hard code notification for every item in the session.
+					 * 
+					 * TODO get notification for every monitored item and add it
+					 * here
+					 */
+					LOG.info("adding monitored items: "
+							+ subscription.getMonitoredItems().size());
+					for (final MonitoredItem item : subscription
+							.getMonitoredItems().values()) {
+
+						// TODO get new values from MonitoredItem.
+
+						final MonitoredItemNotification notification = new MonitoredItemNotification();
+						notification.setClientHandle(item.getClientHandle());
+						notification.setValue(new DataValue(new Variant(23.5)));
+						itemNotifications.add(notification);
+					}
+
+					dataChangeNotification
+							.setMonitoredItems(itemNotifications
+									.toArray(new MonitoredItemNotification[itemNotifications
+											.size()]));
+					dataArray[0] = ExtensionObject
+							.binaryEncode(dataChangeNotification);
+				} catch (final EncodingException e) {
+					LOG.error(e.getMessage(), e);
+					// TODO send ERROR CODE
+				}
+				notificatioMsg.setNotificationData(dataArray);
+
+				LOG.info("publishing...");
+
+				resp.setResponseHeader(ServiceHandlerBase.buildRespHeader(req));
+				serviceReq.sendResponse(resp);
+
+				LOG.info("published");
+
+				// sequencenumber is not allowed to be negative; but we may be
+				// negative because of an underflow
+				if (++sequenceNumber < 0) {
+					sequenceNumber = 0;
+				}
+			} catch (final Exception e) {
+				LOG.error(e.getMessage(), e);
+			}
+		}
+
+	}
+}
